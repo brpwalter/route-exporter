@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Strava-Style Route Builder v5</title>
+    <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+
+    <!-- Leaflet Geocoder CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css" />
+<link rel="stylesheet" href="https://unpkg.com" />
+    
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; background-color: #f7f7fa; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+        #controls { margin-bottom: 15px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        #main-container { display: flex; gap: 20px; flex: 1; min-height: 0; }
+        #map { flex: 3; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); height: 100%; }
+        #sidebar { flex: 1; background: white; border-radius: 8px; padding: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); display: flex; flex-direction: column; min-width: 250px; }
+        #route-list { list-style: none; padding: 0; margin: 0; overflow-y: auto; flex: 1; }
+        #route-list li { padding: 10px; border-bottom: 1px solid #eee; cursor: pointer; transition: 0.2s; border-radius: 4px; }
+        #route-list li:hover { background-color: #f0f0f2; }
+        button { background-color: #fc4c02; color: white; border: none; padding: 10px 18px; font-weight: bold; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #e34402; }
+        .btn-secondary { background-color: #555; }
+        /* Farbe für den Undo-Button */
+        #undoBtn { background-color: #3b5998; }
+        #undoBtn:hover { background-color: #2d4373; }
+        input { padding: 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        h3 { margin-top: 0; color: #333; border-bottom: 2px solid #fc4c02; padding-bottom: 5px; }
+        .stats-box { background-color: #f1f1f5; padding: 8px 15px; border-radius: 4px; font-weight: bold; color: #fc4c02; font-size: 16px; border-left: 4px solid #fc4c02; }
+        .leaflet-control-geocoder { border-radius: 4px; box-shadow: 0 1px 5px rgba(0,0,0,0.4); background: white; }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <input type="text" id="routeName" value="Meine Route" placeholder="Routenname">
+        <select id="routeProfile"><option value="foot">🏃 Laufen / Wandern</option></select>
+        <button id="undoBtn">↩ Rückgängig</button>
+        <button id="saveBtn" class="btn-secondary">In DB Speichern</button>
+        <button id="exportBtn">Als GPX exportieren</button>
+        <button id="clearBtn" style="background-color: #666;">Karte leeren</button>
+        
+        <div class="stats-box">Distanz: <span id="distanceText">0.00</span> km</div>
+        
+        <span id="statusText" style="color: #666; font-size: 14px;">Klicke auf die Karte, um den Startpunkt zu setzen.</span>
+    </div>
+
+    <div id="main-container">
+        <div id="map"></div>
+        <div id="sidebar">
+            <h3>Gespeicherte Routen</h3>
+            <ul id="route-list">
+                <!-- Dynamisch aus DB -->
+            </ul>
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <!-- Leaflet Geocoder Script -->
+    <script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+    
+    <script>
+        const map = L.map('map').setView([49.4521, 11.0767], 14); 
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+
+        // Suchleiste (Komoot Photon Engine)
+        const geocoder = L.Control.geocoder({
+            defaultMarkGeocode: false,
+            placeholder: "Ort oder Adresse suchen...",
+            geocoder: L.Control.Geocoder.photon()
+        })
+        .on('markgeocode', function(e) {
+            const center = e.geocode.center;
+            map.setView(center, 15);
+        })
+        .addTo(map);
+
+        let userClicks = [];       
+        let visualMarkers = [];    
+        let finalRoadPoints = [];  
+        
+        // NEU: Verlaufsspeicher, um Teilstrecken rückgängig machen zu können
+        let historyRoadPointsCount = []; 
+
+        let polyline = L.polyline([], { color: '#fc4c02', weight: 5, opacity: 0.85 }).addTo(map);
+
+        function updateDistanceDisplay() {
+            let total = 0;
+            for (let i = 0; i < finalRoadPoints.length - 1; i++) {
+                const p1 = L.latLng(finalRoadPoints[i].lat, finalRoadPoints[i].lng);
+                const p2 = L.latLng(finalRoadPoints[i + 1].lat, finalRoadPoints[i + 1].lng);
+                total += map.distance(p1, p2); 
+            }
+            document.getElementById('distanceText').innerText = (total / 1000).toFixed(2);
+        }
+
+              // Karten-Klick Event (Mit Profil-Übergabe)
+        map.on('click', async function(e) {
+            const currentLatLng = e.latlng;
+            userClicks.push(currentLatLng);
+
+            const marker = L.circleMarker(currentLatLng, { radius: 6, color: '#000', fillColor: '#fff', fillOpacity: 1, weight: 2 }).addTo(map);
+            visualMarkers.push(marker);
+
+            if (userClicks.length === 1) {
+                historyRoadPointsCount.push(0); 
+                finalRoadPoints.push({ lat: currentLatLng.lat, lng: currentLatLng.lng });
+                document.getElementById('statusText').innerText = "Startpunkt gesetzt. Klicke auf das nächste Ziel.";
+                return;
+            }
+
+            if (userClicks.length >= 2) {
+                document.getElementById('statusText').innerText = "Suche echten Park-/Straßenweg...";
+                const lastClick = userClicks[userClicks.length - 2];
+                
+                // Profil aus dem Dropdown auslesen (Standard: Fußgänger)
+                const profile = document.getElementById('routeProfile') ? document.getElementById('routeProfile').value : 'foot';
+
+                try {
+                    const response = await fetch('/api/route', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                            profile: profile, 
+                            points: [lastClick, currentLatLng] 
+                        })
+                    });
+                    const data = await response.json();
+
+                    if (data.coordinates && data.coordinates.length > 0) {
+                        historyRoadPointsCount.push(finalRoadPoints.length);
+
+                        const newSegmentPoints = data.type === 'road' ? data.coordinates.slice(1) : data.coordinates;
+                        
+                        finalRoadPoints = finalRoadPoints.concat(newSegmentPoints);
+                        polyline.setLatLngs(finalRoadPoints);
+                        updateDistanceDisplay();
+                        
+                        document.getElementById('statusText').innerText = data.type === 'road' ? "Weg durch den Park automatisch berechnet!" : "Luftlinie genutzt (API-Fallback).";
+                    }
+                } catch (err) {
+                    console.error("Routing-Fehler:", err);
+                    document.getElementById('statusText').innerText = "Fehler bei der Kommunikation mit dem Backend.";
+                }
+            }
+        });
+
+        // NEU: Event-Listener für den Rückgängig-Button
+        document.getElementById('undoBtn').addEventListener('click', () => {
+            if (userClicks.length === 0) {
+                document.getElementById('statusText').innerText = "Keine Schritte zum Rückgängig machen.";
+                return;
+            }
+
+            // 1. Letzten Klick-Pin von der Karte löschen
+            const lastMarker = visualMarkers.pop();
+            if (lastMarker) map.removeLayer(lastMarker);
+
+            // 2. Letzten Punkt aus der Klick-Historie werfen
+            userClicks.pop();
+
+            // 3. Straßenpunkte auf den Stand vor diesem Klick kürzen
+            const previousCount = historyRoadPointsCount.pop();
+            
+            if (previousCount === 0 || userClicks.length === 0) {
+                // Wenn wir den allerersten Punkt löschen, leeren wir die Karte komplett
+                finalRoadPoints = [];
+                polyline.setLatLngs([]);
+                document.getElementById('statusText').innerText = "Startpunkt gelöscht. Setze einen neuen Startpunkt.";
+            } else {
+                // Array auf die Länge vor dem letzten Klick abschneiden
+                finalRoadPoints = finalRoadPoints.slice(0, previousCount);
+                polyline.setLatLngs(finalRoadPoints);
+                document.getElementById('statusText').innerText = "Letzter Schritt wurde rückgängig gemacht.";
+            }
+
+            // 4. Distanzbox neu kalkulieren
+            updateDistanceDisplay();
+        });
+
+        document.getElementById('saveBtn').addEventListener('click', async () => {
+            if (finalRoadPoints.length < 2) return alert('Bitte zeichne zuerst eine Route!');
+            const name = document.getElementById('routeName').value;
+
+            const response = await fetch('/api/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, coordinates: finalRoadPoints })
+            });
+            if (response.ok) {
+                alert('Route in DB gespeichert!');
+                loadSavedRoutes();
+            }
+        });
+
+        async function loadSavedRoutes() {
+            const response = await fetch('/api/routes');
+            const routes = await response.json();
+            const listElement = document.getElementById('route-list');
+            listElement.innerHTML = '';
+
+            routes.forEach(route => {
+                const li = document.createElement('li');
+                li.innerHTML = `<strong>${route.name}</strong>`;
+                li.addEventListener('click', () => loadSingleRoute(route.id));
+                listElement.appendChild(li);});
+            }
+
+        async function loadSingleRoute(id) {
+            const response = await fetch(`/api/routes/${id}`);
+            if (!response.ok) return;
+            const route = await response.json();
+            resetMap();
+            finalRoadPoints = route.coordinates;
+        if(finalRoadPoints.length > 0) {
+            userClicks.push(finalRoadPoints[finalRoadPoints.length - 1]);
+            historyRoadPointsCount.push(0); // Dummy für die Historie beim Laden
+        }
+
+        document.getElementById('routeName').value = route.name;
+        polyline.setLatLngs(finalRoadPoints);
+        updateDistanceDisplay();
+
+        if (finalRoadPoints.length > 0) {
+            map.fitBounds(polyline.getBounds());
+        }
+        document.getElementById('statusText').innerText = `Route "${route.name}" geladen.`;
+    }
+        document.getElementById('exportBtn').addEventListener('click', async () => {
+        if (finalRoadPoints.length < 2) return alert('Keine Route zum Exportieren vorhanden!');
+        const routeName = document.getElementById('routeName').value;
+        const response = await fetch('/api/export-gpx', {method: 'POST',headers: { 'Content-Type': 'application/json' },body: JSON.stringify({ routeName, coordinates: finalRoadPoints })});
+        if (response.ok) {const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${routeName.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.gpx`;
+            document.body.appendChild(a);
+            a.click();a.remove();}});
+            
+            function resetMap() {
+                userClicks = [];
+                finalRoadPoints = [];
+                historyRoadPointsCount = [];
+                polyline.setLatLngs([]);
+                visualMarkers.forEach(m => map.removeLayer(m));
+                visualMarkers = [];
+                document.getElementById('distanceText').innerText = "0.00";}
+                document.getElementById('clearBtn').addEventListener('click', () => {resetMap();
+                document.getElementById('statusText').innerText = "Karte geleert.";});
+        loadSavedRoutes();
+   </script>
+</body>
+</html>
