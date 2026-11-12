@@ -27,6 +27,12 @@
         #undoBtn { background-color: #3b5998; }
         #undoBtn:hover { background-color: #2d4373; }
         input { padding: 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        #startLocation, #endLocation { min-width: 180px; }
+        .progress-track { flex: 0 1 160px; height: 6px; overflow: hidden; border-radius: 4px; background: #e5e5e5; }
+        .progress-track[hidden] { display: none; }
+        .progress-track span { display: block; width: 40%; height: 100%; background: #fc4c02; animation: progress-slide 1.2s ease-in-out infinite; }
+        @keyframes progress-slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+        @media (prefers-reduced-motion: reduce) { .progress-track span { width: 100%; animation: none; } }
         h3 { margin-top: 0; color: #333; border-bottom: 2px solid #fc4c02; padding-bottom: 5px; }
         .stats-box { background-color: #f1f1f5; padding: 8px 15px; border-radius: 4px; font-weight: bold; color: #fc4c02; font-size: 16px; border-left: 4px solid #fc4c02; }
         .leaflet-control-geocoder { border-radius: 4px; box-shadow: 0 1px 5px rgba(0,0,0,0.4); background: white; }
@@ -36,6 +42,9 @@
 
     <div id="controls">
         <input type="text" id="routeName" value="Meine Route" placeholder="Routenname">
+        <input type="text" id="startLocation" placeholder="Startpunkt (Ort oder Adresse)" aria-label="Startpunkt">
+        <input type="text" id="endLocation" placeholder="Zielpunkt (Ort oder Adresse)" aria-label="Zielpunkt">
+        <button id="planRouteBtn">Kürzeste gefundene Route</button>
         <select id="routeProfile"><option value="foot">🏃 Laufen / Wandern</option></select>
         <button id="undoBtn">↩ Rückgängig</button>
         <button id="saveBtn" class="btn-secondary">In DB Speichern</button>
@@ -43,8 +52,8 @@
         <button id="clearBtn" style="background-color: #666;">Karte leeren</button>
         
         <div class="stats-box">Distanz: <span id="distanceText">0.00</span> km</div>
-        
-        <span id="statusText" style="color: #666; font-size: 14px;">Klicke auf die Karte, um den Startpunkt zu setzen.</span>
+        <div id="routeProgress" class="progress-track" role="progressbar" aria-label="Routenplanung läuft" aria-valuetext="Wird verarbeitet" hidden><span aria-hidden="true"></span></div>
+        <span id="statusText" role="status" aria-live="polite" style="color: #666; font-size: 14px;">Klicke auf die Karte, um den Startpunkt zu setzen.</span>
     </div>
 
     <div id="main-container">
@@ -67,10 +76,11 @@
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
 
         // Suchleiste (Komoot Photon Engine)
+        const photonGeocoder = L.Control.Geocoder.photon();
         const geocoder = L.Control.geocoder({
             defaultMarkGeocode: false,
             placeholder: "Ort oder Adresse suchen...",
-            geocoder: L.Control.Geocoder.photon()
+            geocoder: photonGeocoder
         })
         .on('markgeocode', function(e) {
             const center = e.geocode.center;
@@ -86,6 +96,84 @@
         let historyRoadPointsCount = []; 
 
         let polyline = L.polyline([], { color: '#fc4c02', weight: 5, opacity: 0.85 }).addTo(map);
+
+        async function geocodeLocation(query) {
+            const results = await photonGeocoder.geocode(query);
+            if (!results || results.length === 0) {
+                throw new Error(`Kein Treffer für „${query}“ gefunden. Bitte prüfe die Eingabe.`);
+            }
+            return results[0].center;
+        }
+
+        function geocodeLocations(startQuery, endQuery) {
+            let timeoutId;
+            const timeout = new Promise((resolve, reject) => {
+                timeoutId = setTimeout(() => {
+                    reject(new Error('Die Ortssuche dauert zu lange. Bitte versuche es erneut.'));
+                }, 12000);
+            });
+
+            return Promise.race([
+                Promise.all([geocodeLocation(startQuery), geocodeLocation(endQuery)]),
+                timeout
+            ]).finally(() => clearTimeout(timeoutId));
+        }
+
+        document.getElementById('planRouteBtn').addEventListener('click', async () => {
+            const startQuery = document.getElementById('startLocation').value.trim();
+            const endQuery = document.getElementById('endLocation').value.trim();
+            const button = document.getElementById('planRouteBtn');
+
+            if (!startQuery || !endQuery) {
+                document.getElementById('statusText').innerText = 'Bitte Start- und Zielpunkt eingeben.';
+                return;
+            }
+
+            button.disabled = true;
+            const progress = document.getElementById('routeProgress');
+            const status = document.getElementById('statusText');
+            progress.hidden = false;
+            status.innerText = 'Suche Start- und Zielort...';
+
+            try {
+                const [start, end] = await geocodeLocations(startQuery, endQuery);
+                status.innerText = 'Orte gefunden. Berechne Fußroute...';
+                const response = await fetch('/api/route', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        profile: 'foot',
+                        points: [start, end],
+                        optimizeDistance: true,
+                        strict: true
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Routing fehlgeschlagen.');
+
+                resetMap();
+                userClicks = [start, end];
+                finalRoadPoints = data.coordinates;
+                historyRoadPointsCount = [0, 1];
+                visualMarkers = [
+                    L.circleMarker(start, { radius: 7, color: '#176b2c', fillColor: '#35b85a', fillOpacity: 1 }).addTo(map),
+                    L.circleMarker(end, { radius: 7, color: '#9b1c1c', fillColor: '#e34444', fillOpacity: 1 }).addTo(map)
+                ];
+                polyline.setLatLngs(finalRoadPoints);
+                updateDistanceDisplay();
+                map.fitBounds(polyline.getBounds(), { padding: [20, 20] });
+
+                const alternativesCount = Number(data.alternativesCount) || 1;
+                status.innerText = alternativesCount > 1
+                    ? `Kürzeste von ${alternativesCount} gefundenen Alternativen angezeigt (nicht global garantiert).`
+                    : 'Eine Fußroute gefunden; der Dienst lieferte keine Alternativen zum Vergleichen.';
+            } catch (error) {
+                status.innerText = error.message || 'Die Route konnte nicht berechnet werden.';
+            } finally {
+                progress.hidden = true;
+                button.disabled = false;
+            }
+        });
 
         function updateDistanceDisplay() {
             let total = 0;

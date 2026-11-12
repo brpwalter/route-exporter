@@ -3,12 +3,14 @@ const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 const axios = require('axios');
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const ROUTES_DB_PATH = process.env.ROUTES_DB_PATH || './routes.db';
+const ROUTING_BASE_URL = process.env.ROUTING_BASE_URL || 'https://routing.openstreetmap.de/routed-foot/route/v1/driving';
 
 app.use(express.json());
 
 // 1. DATENBANK INITIALISIEREN
-const db = new sqlite3.Database('./routes.db', (err) => {
+const db = new sqlite3.Database(ROUTES_DB_PATH, (err) => {
     if (err) console.error('Datenbank-Fehler:', err.message);
     else console.log('Verbunden mit der SQLite-Datenbank.');
 });
@@ -29,6 +31,8 @@ app.get('/', (req, res) => {
 // 2. ROUTING-API (Optimiert für Fußwege, Parks und Radwege via OpenStreetMap-DE)
 app.post('/api/route', async (req, res) => {
     const { profile, points } = req.body; // Profil kommt wieder vom Frontend mit ('foot' oder 'bike')
+    const optimizeDistance = req.body.optimizeDistance === true;
+    const strict = req.body.strict === true;
 
     if (!points || points.length < 2) {
         return res.status(400).json({ error: 'Mindestens zwei Punkte benötigt.' });
@@ -37,18 +41,20 @@ app.post('/api/route', async (req, res) => {
     // Koordinaten für OSRM aufbereiten (lng,lat)
     const osrmCoords = points.map(p => `${Number(p.lng).toFixed(6)},${Number(p.lat).toFixed(6)}`).join(';');
     
-    // Profil-Mapping für den OSM-DE Server (foot = Fußgänger, bike = Fahrrad)
-    const osrmProfile = profile === 'bike' ? 'foot' : 'foot'; // Falls 'bike' Probleme macht, ist 'foot' der sicherste Weg durch Parks
-    
-    // Wir nutzen hier den stabilen OpenStreetMap.de Routing-Server für Fußgänger/Radfahrer
-    const url = `https://openstreetmap.de/route/v1/${osrmProfile}/${osrmCoords}?overview=full&geometries=geojson`;
-    // Hinweis: Die URL nutzt am Ende '/driving', aber der Server 'routed-foot' biegt es intern exakt auf Fußwege ab!
+    // routed-foot exposes its foot profile through OSRM's driving endpoint.
+    const osrmProfile = 'driving';
+    const alternativesOption = optimizeDistance ? '&alternatives=3' : '';
+    const url = `${ROUTING_BASE_URL}/${osrmCoords}?overview=full&geometries=geojson${alternativesOption}`;
 
     try {
         const response = await axios.get(url);
         
         if (response.data && response.data.routes && response.data.routes.length > 0) {
-            const geometry = response.data.routes[0].geometry.coordinates; // Korrektur: Erstes Element der Route ansteuern
+            const routes = response.data.routes;
+            const selectedRoute = optimizeDistance
+                ? routes.reduce((shortest, route) => route.distance < shortest.distance ? route : shortest)
+                : routes[0];
+            const geometry = selectedRoute.geometry.coordinates;
             
             const leafletCoords = geometry.map(coord => ({ 
                 lat: Number(coord[1]), // Index 1 ist Breitengrad
@@ -56,12 +62,24 @@ app.post('/api/route', async (req, res) => {
             }));
             
             console.log(`[Erfolg] Park-/Straßenweg berechnet: ${leafletCoords.length} Punkte.`);
-            return res.json({ coordinates: leafletCoords, type: 'road' });
+            return res.json({
+                coordinates: leafletCoords,
+                type: 'road',
+                alternativesCount: routes.length
+            });
         } else {
             throw new Error('Keine Route im Park gefunden.');
         }
     } catch (error) {
-        console.warn(`[Routing-Hinweis] OSRM fehlgeschlagen. Grund: ${error.message}. Nutze Luftlinie.`);
+        const upstreamError = error.response && error.response.data;
+        const detail = upstreamError && (upstreamError.message || upstreamError.code);
+        const message = detail
+            ? `Routingdienst meldet: ${detail}`
+            : 'Der Routingdienst ist momentan nicht erreichbar.';
+        console.warn(`[Routing-Hinweis] OSRM fehlgeschlagen. Grund: ${error.message}${detail ? ` (${detail})` : ''}${strict ? '' : '. Nutze Luftlinie.'}`);
+        if (strict) {
+            return res.status(502).json({ error: message });
+        }
         // Fallback auf die direkte Verbindung zwischen den beiden Punkten
         return res.json({ coordinates: points, type: 'straight' });
     }
